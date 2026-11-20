@@ -11,7 +11,8 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "mqtt_client.h"
-#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "esp_adc_cal.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -21,53 +22,80 @@
 
 #define MQTT_BROKER_URL "mqtt://broker.hivemq.com:1883"
 
-#define TOPIC_LED_CONTROL    "altrobyte/home/led/control"
-#define TOPIC_LED_STATUS     "altrobyte/home/led/status"
+#define TOPIC_ADC_DATA       "altrobyte/home/adc/data"
 #define TOPIC_SYSTEM_STATUS  "altrobyte/home/system/status"
 
-#define LED_PIN    GPIO_NUM_2
+// ADC config — GPIO34 = ADC1 Channel 6
+#define ADC_CHANNEL     ADC1_CHANNEL_6   // GPIO34
+#define ADC_ATTEN       ADC_ATTEN_DB_11  // 0–3.9V range
+#define ADC_WIDTH       ADC_WIDTH_BIT_12 // 12-bit = 0–4095
+#define ADC_VREF        1100             // mV, used for calibration
 
-static const char *TAG = "MQTT_HOME";
+static const char *TAG = "MQTT_ADC";
 static EventGroupHandle_t wifi_event_group;
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 static int wifi_retry = 0;
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;
-static bool led_state = false;
+static esp_adc_cal_characteristics_t adc_chars;
 
-static void gpio_init_pins(void)
+// ── ADC Init ────────────────────────────────────────────────
+static void adc_init_pins(void)
 {
-    gpio_reset_pin(LED_PIN);
-    gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_PIN, 0);
+    adc1_config_width(ADC_WIDTH);
+    adc1_config_channel_atten(ADC_CHANNEL, ADC_ATTEN);
+
+    // Characterize ADC for accurate voltage conversion
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN, ADC_WIDTH,
+                             ADC_VREF, &adc_chars);
+    ESP_LOGI(TAG, "ADC initialized on GPIO34 (CH6)");
 }
 
+// ── MQTT Publish ─────────────────────────────────────────────
 static void publish_status(const char* topic, const char* message)
 {
     if (mqtt_client == NULL) return;
-    esp_mqtt_client_publish(mqtt_client, topic, message, 0, 1, 1);
+    esp_mqtt_client_publish(mqtt_client, topic, message, 0, 1, 0);
     ESP_LOGI(TAG, "Published -> %s : %s", topic, message);
 }
 
-static void handle_led(const char* msg, int len)
+// ── ADC Read Task (publishes every 5 seconds) ───────────────
+static void adc_task(void* arg)
 {
-    char cmd[16] = {0};
-    strncpy(cmd, msg, len < 15 ? len : 15);
+    int uptime = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        uptime += 5;
 
-    if (strcmp(cmd, "ON") == 0) {
-        led_state = true;
-        gpio_set_level(LED_PIN, 1);
-        publish_status(TOPIC_LED_STATUS, "ON");
-        ESP_LOGI(TAG, "LED -> ON");
-    } else if (strcmp(cmd, "OFF") == 0) {
-        led_state = false;
-        gpio_set_level(LED_PIN, 0);
-        publish_status(TOPIC_LED_STATUS, "OFF");
-        ESP_LOGI(TAG, "LED -> OFF");
+        // Average 64 samples to reduce noise
+        uint32_t raw_sum = 0;
+        for (int i = 0; i < 64; i++) {
+            raw_sum += adc1_get_raw(ADC_CHANNEL);
+        }
+        uint32_t raw_avg = raw_sum / 64;
+
+        // Convert to millivolts using calibration
+        uint32_t voltage_mv = esp_adc_cal_raw_to_voltage(raw_avg, &adc_chars);
+
+        ESP_LOGI(TAG, "ADC Raw: %lu | Voltage: %lu mV", raw_avg, voltage_mv);
+
+        if (mqtt_client != NULL) {
+            char msg[80];
+            snprintf(msg, sizeof(msg),
+                     "{\"raw\":%lu,\"voltage_mv\":%lu,\"uptime_s\":%d}",
+                     raw_avg, voltage_mv, uptime);
+            publish_status(TOPIC_ADC_DATA, msg);
+
+            // Heartbeat on system topic
+            char sys_msg[48];
+            snprintf(sys_msg, sizeof(sys_msg), "ONLINE|Up:%ds", uptime);
+            publish_status(TOPIC_SYSTEM_STATUS, sys_msg);
+        }
     }
 }
 
+// ── MQTT Event Handler ───────────────────────────────────────
 static void mqtt_event_handler(void* handler_args, esp_event_base_t base,
                                 int32_t event_id, void* event_data)
 {
@@ -77,27 +105,13 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base,
     {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG, "MQTT Connected!");
-            esp_mqtt_client_subscribe(mqtt_client, TOPIC_LED_CONTROL, 1);
             publish_status(TOPIC_SYSTEM_STATUS, "ONLINE");
-            publish_status(TOPIC_LED_STATUS, "OFF");
-            ESP_LOGI(TAG, "Ready! Publish ON/OFF to: %s", TOPIC_LED_CONTROL);
+            ESP_LOGI(TAG, "Publishing ADC data to: %s", TOPIC_ADC_DATA);
             break;
 
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT Disconnected.");
             mqtt_client = NULL;
-            break;
-
-        case MQTT_EVENT_DATA:
-            ESP_LOGI(TAG, "Topic: %.*s | Msg: %.*s",
-                     event->topic_len, event->topic,
-                     event->data_len,  event->data);
-
-            if (strncmp(event->topic, TOPIC_LED_CONTROL,
-                        event->topic_len) == 0)
-            {
-                handle_led(event->data, event->data_len);
-            }
             break;
 
         case MQTT_EVENT_ERROR:
@@ -120,21 +134,7 @@ static void mqtt_start(void)
     esp_mqtt_client_start(mqtt_client);
 }
 
-static void heartbeat_task(void* arg)
-{
-    int uptime = 0;
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(10000));
-        uptime += 10;
-        if (mqtt_client != NULL) {
-            char msg[48];
-            snprintf(msg, sizeof(msg), "ONLINE|Up:%ds|LED:%s",
-                     uptime, led_state ? "ON" : "OFF");
-            publish_status(TOPIC_SYSTEM_STATUS, msg);
-        }
-    }
-}
-
+// ── WiFi ─────────────────────────────────────────────────────
 static void wifi_event_handler(void* arg, esp_event_base_t base,
                                 int32_t event_id, void* event_data)
 {
@@ -196,17 +196,17 @@ static void wifi_init(void)
     }
 }
 
+// ── app_main ─────────────────────────────────────────────────
 void app_main(void)
 {
-    /* Disable brownout detector */
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
     printf("\n============================================\n");
-    printf("  MQTT Home Automation - Altrobyte\n");
+    printf("  MQTT ADC Logger - Altrobyte\n");
     printf("  Instructor: Pawan Meena\n");
     printf("============================================\n\n");
 
-    gpio_init_pins();
+    adc_init_pins();
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -219,5 +219,5 @@ void app_main(void)
     wifi_init();
     mqtt_start();
 
-    xTaskCreate(heartbeat_task, "heartbeat", 4096, NULL, 5, NULL);
+    xTaskCreate(adc_task, "adc_task", 4096, NULL, 5, NULL);
 }
